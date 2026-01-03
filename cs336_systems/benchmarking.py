@@ -1,6 +1,7 @@
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.nn_utils import cross_entropy
+import torch.cuda.nvtx as nvtx
 import argparse
 import torch
 import timeit
@@ -28,8 +29,42 @@ def get_args():
     # --- control --- #
     parser.add_argument('--warm_up',type=int,default=5,help='warm up steps')
     parser.add_argument('--iters',type=int,default=10,help='measure steps')
+    parser.add_argument('--profile_memory', action='store_true', help='是否生成显存快照')
+    parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'], help='Precision mode')
 
     return parser.parse_args()
+
+def profile_step(model, optimizer, x, y, args, ptdtype):
+    # 根据精度生成文件名，例如：memory_snapshot_fp16.pickle
+    snapshot_file = f"memory_snapshot_{args.precision}.pickle"
+    print(f"\n[!] 正在记录 {args.precision} 模式下的显存历史...")
+
+    # 1. 开启记录 (包含 Python 堆栈)
+    torch.cuda.memory._record_memory_history(enabled='all', max_entries=100000)
+
+    # 2. 执行受控的单步更新
+    # 使用与正式训练完全一致的 autocast 环境
+    use_autocast = args.precision != 'fp32'
+    use_scaler = args.precision == 'fp16'
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
+
+    optimizer.zero_grad(set_to_none=True)
+    
+    with torch.autocast(device_type='cuda', dtype=ptdtype, enabled=use_autocast):
+        logits = model(x)
+        loss = cross_entropy(logits, y)
+    
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+
+    # 3. 导出快照
+    torch.cuda.synchronize()
+    torch.cuda.memory._dump_snapshot(snapshot_file)
+    
+    # 4. 关闭记录
+    torch.cuda.memory._record_memory_history(enabled=None)
+    print(f"[OK] {args.precision} 显存快照已导出至 {snapshot_file}")
 
 def generate_random_batch(batch_size,context_length,vocab_size,device):
     input_ids = torch.randint(
@@ -81,14 +116,28 @@ def benchmark():
             device
         )
     
+    ptdtype = {'fp32': torch.float32, 'fp16': torch.float16, 'bf16': torch.bfloat16}[args.precision]
+    
+    # 只有 fp16 需要 GradScaler，bf16 和 fp32 使用不执行任何操作的 dummy scaler 即可
+    # 或者用逻辑判断，这里我们直接初始化，后面按需使用
+    use_scaler = args.precision == 'fp16'
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
+
+    if args.profile_memory:
+        profile_step(model,optimizer,x,y,args,ptdtype)
+        return
+
     # --- warm up --- #
+    print(f"训练精度：{ptdtype}")
     print(f"[>] 开始预热 (Warm-up steps: {args.warm_up})...")
     for _ in range(args.warm_up):
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = cross_entropy(logits,y)
-        loss.backward()
-        optimizer.step()
+        with torch.autocast(device_type='cuda',dtype=ptdtype):
+            logits = model(x)
+            loss = cross_entropy(logits,y)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
     # --- Measurement --- #
     # print(f"[>] 开始正式测量 (Iters: {args.iters})...")
@@ -103,31 +152,36 @@ def benchmark():
 
     forward_times = []
     backward_times = []
+    optimize_times = []
     for i in range(args.iters):
-        print(f"\r正在测量第 {i+1}/{args.iters} 次迭代...", end="", flush=True)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        # --- forward ---
         optimizer.zero_grad(set_to_none=True)
-        t0 = timeit.default_timer()
-        logits = model(x)
-        loss = cross_entropy(logits,y)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t1 = timeit.default_timer()
-        forward_times.append(t1-t0)
+        torch.cuda.synchronize()
 
-        if torch.cuda.is_available():
+        # --- Forward ---
+        with torch.autocast(device_type='cuda', dtype=ptdtype, enabled=(args.precision != 'fp32')):
+            t0 = timeit.default_timer()
+            logits = model(x)
+            loss = cross_entropy(logits, y)
             torch.cuda.synchronize()
-        # --- backward ---
+            t1 = timeit.default_timer()
+        forward_times.append(t1 - t0)
+
+        # --- Backward ---
         t2 = timeit.default_timer()
-        loss.backward()
-        optimizer.step()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # 如果是 FP16，需要 scale loss
+        scaler.scale(loss).backward()
+        torch.cuda.synchronize()
         t3 = timeit.default_timer()
-        backward_times.append(t3-t2)
+        backward_times.append(t3 - t2)
+
+        # --- Optimize ---
+        t4 = timeit.default_timer()
+        # scaler.step 内部会自动判断是否需要 unscale
+        scaler.step(optimizer)
+        scaler.update()
+        torch.cuda.synchronize()
+        t5 = timeit.default_timer()
+        optimize_times.append(t5 - t4)
 
     f_avg = np.mean(forward_times)
     f_std = np.std(forward_times)
@@ -135,12 +189,15 @@ def benchmark():
     b_avg = np.mean(backward_times)
     b_std = np.std(backward_times)
 
+    o_avg = np.mean(optimize_times)
+    o_std = np.std(optimize_times)
+
     print(f"\n{'='*30}")
     print(f"Forward Pass:  {f_avg:.6f}s ± {f_std:.6f}s")
     print(f"Backward Pass: {b_avg:.6f}s ± {b_std:.6f}s")
-
+    print(f"Optimize:  {o_avg:.6f}s ± {o_std:.6f}s")
+    
 
 
 if __name__ == "__main__":
     benchmark()
-    
